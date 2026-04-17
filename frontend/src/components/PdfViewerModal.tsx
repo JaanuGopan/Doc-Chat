@@ -20,7 +20,8 @@ interface BBox {
 interface PdfViewerModalProps {
   open: boolean;
   onClose: () => void;
-  file: File | null;
+  file: File | string | null; // Support File or remote URL
+  filename?: string;
   initialPage?: number;
   highlightText?: string;
 }
@@ -29,6 +30,7 @@ export const PdfViewerModal = ({
   open,
   onClose,
   file,
+  filename,
   initialPage = 1,
   highlightText = "",
 }: PdfViewerModalProps) => {
@@ -66,7 +68,14 @@ export const PdfViewerModal = ({
 
     (async () => {
       try {
-        const arrayBuffer = await file.arrayBuffer();
+        let arrayBuffer: ArrayBuffer;
+        if (typeof file === "string") {
+          const resp = await fetch(file);
+          arrayBuffer = await resp.arrayBuffer();
+        } else {
+          arrayBuffer = await file.arrayBuffer();
+        }
+
         const loadingTask = pdfjs.getDocument({ data: arrayBuffer });
         const pdfDoc = await loadingTask.promise;
         if (cancelled) return;
@@ -107,8 +116,6 @@ export const PdfViewerModal = ({
           if (!itemText) continue;
 
           // Check if this item (or a multi-item window) contains part of the needle
-          // Strategy: build a running window of up to 8 consecutive spans and look
-          // for overlap with the needle's first 2-3 words.
           const windowText = items
             .slice(i, i + 8)
             .map((x) => x.str)
@@ -125,26 +132,19 @@ export const PdfViewerModal = ({
             const hasMatch = needleWords.some((w) => spanLower.includes(w));
             if (!hasMatch) continue;
 
-            // Convert PDF transform → pixel rect
-            // transform = [scaleX, skewX, skewY, scaleY, tx, ty]  (PDF user-space)
             const [, , , , tx, ty] = span.transform;
-
-            // pdfjs viewport.convertToViewportPoint maps PDF coords to CSS coords
             const [px, py] = viewport.convertToViewportPoint(tx, ty);
-
             const spanWidthPx = span.width * scale;
-            // Height: use the font size (abs of scaleY) * scale, or item.height
             const spanHeightPx = (span.height || Math.abs(span.transform[3])) * scale;
 
             foundBoxes.push({
               left: px,
-              top: py - spanHeightPx,   // pdfjs y is baseline; shift up by height
+              top: py - spanHeightPx,   
               width: spanWidthPx,
-              height: spanHeightPx * 1.15, // slight padding
+              height: spanHeightPx * 1.15,
             });
           }
 
-          // Only highlight the first matching window
           if (foundBoxes.length > 0) break;
         }
 
@@ -174,10 +174,9 @@ export const PdfViewerModal = ({
         className="max-w-3xl h-[90vh] flex flex-col p-0 gap-0"
         style={{ ["--dialog-close-display" as string]: "none" }}
       >
-        {/* Header with page controls */}
-        <DialogHeader className="flex-shrink-0 flex flex-row items-center justify-between px-4 py-3 border-b border-border">
+        <DialogHeader className="flex-shrink-0 flex flex-row items-center justify-between px-4 pr-12 py-3 border-b border-border">
           <DialogTitle className="text-sm font-semibold truncate max-w-xs">
-            {file.name}
+            {filename || (typeof file === "string" ? "Document" : file.name)}
           </DialogTitle>
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground whitespace-nowrap">
@@ -208,7 +207,6 @@ export const PdfViewerModal = ({
           ref={containerRef}
           className="flex-1 overflow-auto flex justify-center bg-muted/40 p-4"
         >
-          {/* Wrapper for Page + highlight overlays */}
           <div className="relative" style={pageSize ? { width: pageSize.width, height: pageSize.height } : {}}>
             <Document
               file={file}
@@ -231,7 +229,6 @@ export const PdfViewerModal = ({
               />
             </Document>
 
-            {/* Bounding-box highlight overlays */}
             {highlights.map((box, i) => (
               <div
                 key={i}
@@ -253,8 +250,6 @@ export const PdfViewerModal = ({
           </div>
         </div>
       </DialogContent>
-
-      {/* Keyframe animation injected via a style tag */}
       <style>{`
         @keyframes bbox-pulse {
           0%, 100% { opacity: 1; }

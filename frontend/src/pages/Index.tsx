@@ -1,25 +1,70 @@
-import { ChatPanel, Message as ChatMessage } from "@/components/ChatPanel";
-import { FileUpload } from "@/components/FileUpload";
-import { TextInput } from "@/components/TextInput";
-import { ModelSelector, ModelProvider } from "@/components/ModelSelector";
-import { Card, CardContent } from "@/components/ui/card";
-import { Label } from "@/components/ui/label";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import { ModeToggle } from "@/components/ModeToggle";
-import { useState, useEffect } from "react";
+import { Message as ChatMessage, ChatPanel } from "@/components/ChatPanel";
+import { IngestionState, IngestionStatus } from "@/components/IngestionStatus";
+import { ModelProvider } from "@/components/ModelSelector";
+import { Auth } from "@/components/Auth";
+import { useAuth } from "@/context/AuthContext";
+import { supabase } from "@/lib/supabase";
+import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+import { Loader2 } from "lucide-react";
 
 type Source = "file" | "text";
 
+const BACKEND_URL = "http://localhost:8000";
+
+/** Simple MD5-like hash for frontend duplicate detection */
+async function computeFileHash(file: File): Promise<string> {
+  const buffer = await file.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 const Index = () => {
+  const { user, isLoading: isAuthLoading, signOut } = useAuth();
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [textContent, setTextContent] = useState("");
-  const [activeSource, setActiveSource] = useState<Source>("file");
+  const [thinkingEnabled, setThinkingEnabled] = useState(false);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
 
-  // Model selection state
+  // Persistence
+  const [activeDocId, setActiveDocId] = useState<string | null>(null);
+  const [userDocs, setUserDocs] = useState<any[]>([]);
+  const [isDocsLoading, setIsDocsLoading] = useState(false);
+
+  // RAG State
+  const [ingestionState, setIngestionState] = useState<IngestionState>("idle");
+  const [chunkCount, setChunkCount] = useState<number>(0);
+  const [ingestionError, setIngestionError] = useState<string>("");
+
+  // Model selection
   const [modelProvider, setModelProvider] = useState<ModelProvider>("groq");
   const [localModel, setLocalModel] = useState("qwen/qwen3.5-2b");
 
+  // Fetch user documents on load
+  useEffect(() => {
+    if (user) {
+      fetchUserDocuments();
+    }
+  }, [user]);
+
+  async function fetchUserDocuments() {
+    if (!user) return;
+    setIsDocsLoading(true);
+    try {
+      const resp = await fetch(`${BACKEND_URL}/documents/${user.id}`);
+      const data = await resp.json();
+      if (data.documents) {
+        setUserDocs(data.documents);
+      }
+    } catch (err) {
+      console.error("Failed to fetch documents:", err);
+    } finally {
+      setIsDocsLoading(false);
+    }
+  }
+
+  // PDF object URL
   useEffect(() => {
     if (selectedFile && selectedFile.type === "application/pdf") {
       const url = URL.createObjectURL(selectedFile);
@@ -29,32 +74,162 @@ const Index = () => {
     setPdfUrl(null);
   }, [selectedFile]);
 
+  // ── Auto-ingest when file is chosen ─────────────────────────────────────────
+  const isInternalChange = useRef(false);
+
+  useEffect(() => {
+    if (selectedFile && !isInternalChange.current) {
+      runIngestion({ file: selectedFile });
+    }
+    isInternalChange.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFile]);
+
+  async function runIngestion({
+    file,
+    text,
+  }: {
+    file?: File;
+    text?: string;
+  }) {
+    if (!user) return;
+
+    setIngestionState("indexing");
+    setChunkCount(0);
+    setIngestionError("");
+    setChatMessages([
+      {
+        id: "welcome",
+        type: "system",
+        content: "Processing document…",
+      },
+    ]);
+
+    try {
+      let documentId = "";
+      
+      // 1. Hash check (duplicate detection)
+      let hash = "";
+      if (file) {
+        hash = await computeFileHash(file);
+        const existing = userDocs.find(d => d.file_hash === hash);
+        if (existing) {
+          toast.success("Document already exists! Loading indexed data...");
+          setActiveDocId(existing.id);
+          setChunkCount(existing.chunk_count);
+          setIngestionState("ready");
+          setChatMessages([{ id: "ready", type: "system", content: `✅ This document is already indexed (${existing.chunk_count} chunks). Ready to chat!` }]);
+          return;
+        }
+      }
+
+      // 2. Upload to Supabase Storage first
+      let storagePath = "";
+      if (file) {
+        const fileExt = file.name.split('.').pop();
+        const fileName = `${Math.random()}.${fileExt}`;
+        const filePath = `${user.id}/${fileName}`;
+        
+        const { error: uploadError } = await supabase.storage
+          .from('documents')
+          .upload(filePath, file);
+
+        if (uploadError) throw uploadError;
+        storagePath = filePath;
+      }
+
+      // 3. Create document record in DB
+      const { data: newDoc, error: docError } = await supabase
+        .from('documents')
+        .insert([{
+          user_id: user.id,
+          filename: file ? file.name : "pasted-text",
+          file_hash: hash,
+          storage_path: storagePath,
+          chunk_count: 0
+        }])
+        .select()
+        .single();
+
+      if (docError) throw docError;
+      documentId = newDoc.id;
+      setActiveDocId(documentId);
+
+      // 4. Trigger backend ingestion
+      const formData = new FormData();
+      formData.append("user_id", user.id);
+      formData.append("document_id", documentId);
+      if (file) {
+        formData.append("file", file);
+      } else if (text) {
+        formData.append("text_content", text);
+        formData.append("filename", "pasted-text.txt");
+      }
+
+      const resp = await fetch(`${BACKEND_URL}/ingest/`, {
+        method: "POST",
+        body: formData,
+      });
+      const data = await resp.json();
+
+      if (!resp.ok || data.error) {
+        throw new Error(data.error ?? "Ingestion failed");
+      }
+
+      setChunkCount(data.chunk_count);
+      setIngestionState("ready");
+      setChatMessages([
+        {
+          id: "ready",
+          type: "system",
+          content: `✅ Document indexed into **${data.chunk_count} chunks**. Ask me anything about it!`,
+        },
+      ]);
+      fetchUserDocuments(); // Refresh list
+    } catch (err: any) {
+      setIngestionState("error");
+      setIngestionError(err.message ?? "Unknown error");
+      setChatMessages([{ id: "error", type: "system", content: `❌ Indexing failed: ${err.message}` }]);
+    }
+  }
+
+  // ── Chat ─────────────────────────────────────────────────────────────────────
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
       id: "welcome",
       type: "system",
-      content:
-        "Welcome to Doc-Chat! Upload a PDF or paste text to enable Q&A about your document. I'll answer using only your document.",
+      content: "Welcome to Doc-Chat! Click the **+** button to upload a document and start chatting.",
     },
   ]);
-
   const [isChatLoading, setIsChatLoading] = useState(false);
 
-  // Ready when we have either a file or sufficient pasted text
-  const isDocReady = Boolean(selectedFile) || textContent.trim().length > 0;
-
   const handleSendMessage = async (message: string) => {
-    if (!isDocReady) return;
+    if (!activeDocId) {
+      toast.error("Please select or upload a document first.");
+      return;
+    }
     setIsChatLoading(true);
 
-    // Add user message to chat
+    const userMessageId = Date.now().toString();
     setChatMessages((prev) => [
       ...prev,
-      { id: Date.now().toString(), type: "user", content: message },
+      { id: userMessageId, type: "user", content: message },
     ]);
 
     try {
-      const result = await askChatbot(message);
+      const formData = new FormData();
+      formData.append("document_id", activeDocId);
+      formData.append("question", message);
+      formData.append("model_provider", modelProvider);
+      formData.append("local_model", localModel);
+      formData.append("use_thinking", thinkingEnabled ? "true" : "false");
+
+      const resp = await fetch(`${BACKEND_URL}/chat/`, {
+        method: "POST",
+        body: formData,
+      });
+      const result = await resp.json();
+
       setChatMessages((prev) => [
         ...prev,
         {
@@ -64,166 +239,105 @@ const Index = () => {
           references: result.references ?? [],
         },
       ]);
-    } catch (err) {
+    } catch {
       setChatMessages((prev) => [
         ...prev,
-        {
-          id: (Date.now() + 1).toString(),
-          type: "system",
-          content: "Error contacting backend.",
-        },
+        { id: (Date.now() + 1).toString(), type: "system", content: "Error contacting backend." },
       ]);
     }
     setIsChatLoading(false);
   };
 
-  const handleClearChat = () => {
-    setChatMessages([]);
+  const handleClearChat = () => setChatMessages([]);
+
+  const handleRemoveFile = async () => {
+    if (!activeDocId) return;
+    try {
+      await fetch(`${BACKEND_URL}/document/${activeDocId}`, { method: "DELETE" });
+      
+      const doc = userDocs.find(d => d.id === activeDocId);
+      if (doc?.storage_path) {
+        await supabase.storage.from('documents').remove([doc.storage_path]);
+      }
+
+      setIngestionState("idle");
+      setActiveDocId(null);
+      setSelectedFile(null);
+      setChunkCount(0);
+      setChatMessages([{ id: "welcome", type: "system", content: "Document removed. Upload a new one to continue." }]);
+      fetchUserDocuments();
+    } catch (err: any) {
+      toast.error("Failed to remove document");
+    }
   };
 
-  async function askChatbot(question: string) {
-    const BACKEND_URL = "http://localhost:8000";
-    const endpoint = `${BACKEND_URL}/chat/`;
+  const handleSelectExisting = (doc: any) => {
+    setActiveDocId(doc.id);
+    setChunkCount(doc.chunk_count);
+    setIngestionState("ready");
+    setChatMessages([{ id: "ready", type: "system", content: `✅ Document "**${doc.filename}**" loaded. Ask me anything!` }]);
+    
+    isInternalChange.current = true;
+    setSelectedFile(null);
+  };
 
-    const formData = new FormData();
-    if (activeSource === "file" && selectedFile) {
-      formData.append("file", selectedFile);
-    } else if (activeSource === "text" && textContent) {
-      formData.append("text_content", textContent);
-    } else if (selectedFile) {
-      formData.append("file", selectedFile);
-    } else if (textContent) {
-      formData.append("text_content", textContent);
-    }
-
-    formData.append("question", question);
-    formData.append("model_provider", modelProvider);
-    formData.append("local_model", localModel);
-
-    const response = await fetch(endpoint, {
-      method: "POST",
-      body: formData,
-    });
-
-    const data = await response.json();
-    return data;
+  if (isAuthLoading) {
+    return (
+      <div className="h-screen flex items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    );
   }
 
-  const providerLabel =
-    modelProvider === "groq" ? "Groq (llama-3.3-70b)" : `Local · ${localModel}`;
+  if (!user) {
+    return <Auth />;
+  }
 
   return (
-    <div className="min-h-screen bg-background text-foreground transition-colors duration-300 relative">
-      <div className="absolute top-4 right-4 md:top-8 md:right-8">
-        <ModeToggle />
-      </div>
-
-      <div className="container mx-auto px-4 py-8 max-w-5xl">
-        {/* Header */}
-        <div className="text-center mb-10">
-          <h1 className="text-3xl font-bold text-foreground mb-3">
-            Doc-Chat
-          </h1>
-          <p className="text-lg text-muted-foreground mb-1">
-            Upload a document or paste text, then ask anything.
-          </p>
-          <p className="text-sm text-muted-foreground">
-            Powered by{" "}
-            <span className="font-medium text-primary">{providerLabel}</span>
-          </p>
-        </div>
-
-        {/* Main Content */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-          {/* Left Column - Input sources */}
-          <div className="space-y-6">
-            <Card className="border-border">
-              <CardContent className="p-6">
-                <div className="flex flex-col gap-6">
-                  <FileUpload
-                    onFileSelect={setSelectedFile}
-                    selectedFile={selectedFile}
-                    onClearFile={() => setSelectedFile(null)}
-                  />
-
-                  <div className="text-center text-sm font-bold text-muted-foreground">OR</div>
-
-                  <TextInput value={textContent} onChange={setTextContent} />
-                </div>
-
-                {/* Source Selection */}
-                {selectedFile && textContent.trim().length > 0 && (
-                  <div className="mt-6 pt-6 border-t border-border">
-                    <RadioGroup
-                      value={activeSource}
-                      onValueChange={setActiveSource as any}
-                    >
-                      <div className="flex items-center space-x-6 flex-wrap">
-                        <Label className="text-sm font-medium w-full mb-2">
-                          Use this source:
-                        </Label>
-                        <div className="flex items-center space-x-2">
-                          <RadioGroupItem value="file" id="source-file" />
-                          <Label htmlFor="source-file" className="text-sm">
-                            Uploaded file
-                          </Label>
-                        </div>
-                        <div className="flex items-center space-x-2">
-                          <RadioGroupItem value="text" id="source-text" />
-                          <Label htmlFor="source-text" className="text-sm">
-                            Pasted text
-                          </Label>
-                        </div>
-                      </div>
-                    </RadioGroup>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-
-            {/* Model Selector Card */}
-            <Card className="border-border">
-              <CardContent className="p-6">
-                <ModelSelector
-                  value={modelProvider}
-                  onChange={setModelProvider}
-                  localModel={localModel}
-                  onLocalModelChange={setLocalModel}
-                />
-              </CardContent>
-            </Card>
-          </div>
-
-          {/* Right Column - Chat */}
-          <div className="lg:col-span-1">
-            <div className="h-[500px] sm:h-[600px] lg:h-[700px] w-full">
+    <div className="min-h-screen bg-background text-foreground transition-colors duration-300 relative selection:bg-primary/20">
+      <div className="container mx-auto px-4 py-8 max-w-4xl h-screen flex flex-col">
+        <div className="flex-1 min-h-0 flex flex-col items-center">
+            <div className="w-full max-w-3xl flex-1 min-h-0">
               <ChatPanel
                 messages={chatMessages}
                 onSendMessage={handleSendMessage}
                 onClearChat={handleClearChat}
                 isLoading={isChatLoading}
-                disabled={!isDocReady}
+                disabled={ingestionState === "indexing"}
                 pdfFile={selectedFile}
+                onFileSelect={setSelectedFile}
+                onRemoveFile={handleRemoveFile}
+                thinkingEnabled={thinkingEnabled}
+                onThinkingToggle={setThinkingEnabled}
+                modelProvider={modelProvider}
+                onModelProviderChange={setModelProvider}
+                localModel={localModel}
+                onLocalModelChange={setLocalModel}
+                activeDocumentId={activeDocId}
+                userDocuments={userDocs}
+                onSelectDocument={handleSelectExisting}
+                onSignOut={signOut}
                 placeholder={
-                  isDocReady
-                    ? "Ask about this document…"
-                    : "Upload a PDF or paste text first."
+                  ingestionState === "indexing"
+                    ? "Indexing document…"
+                    : "Ask anything about the document…"
                 }
               />
             </div>
-          </div>
+
+            <div className="w-full max-w-2xl mt-4">
+              <IngestionStatus
+                state={ingestionState}
+                chunkCount={chunkCount}
+                errorMessage={ingestionError}
+              />
+            </div>
         </div>
 
-        {/* Footer */}
-        <footer className="mt-16 pt-8 border-t border-border text-center">
-          <div className="flex justify-center space-x-6 text-sm text-muted-foreground">
-            <a href="#" className="hover:text-primary transition-colors">
-              Privacy
-            </a>
-            <a href="#" className="hover:text-primary transition-colors">
-              Model &amp; Limitations
-            </a>
-          </div>
+        <footer className="py-4 text-center shrink-0">
+          <p className="text-[11px] text-muted-foreground opacity-60 font-medium uppercase tracking-widest">
+            Experimental System · RAG Pipeline v2.0
+          </p>
         </footer>
       </div>
     </div>
