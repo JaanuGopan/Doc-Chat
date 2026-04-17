@@ -60,17 +60,49 @@ def generate_chat_response(chunks: list[dict], question: str, use_thinking: bool
 
     raw = response.choices[0].message.content.strip()
 
-    # Strip markdown code fences if the model wraps in ```json ... ```
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1]
-        if raw.endswith("```"):
-            raw = raw.rsplit("```", 1)[0]
+    import re
+    
+    def clean_json_string(s: str) -> str:
+        # 1. Remove markdown formatting if present
+        s = s.strip()
+        if s.startswith("```"):
+            s = re.sub(r'^```[a-z]*\n?', '', s)
+            s = re.sub(r'\n?```$', '', s)
+        
+        # 2. Extract the actual { ... } or [ ... ] block
+        match = re.search(r'(\{.*\}|\[.*\])', s, re.DOTALL)
+        if not match:
+            return s
+        s = match.group(0)
+        
+        # 3. Fix unescaped newlines inside strings that break json.loads
+        # This regex looks for newlines that are NOT preceded by a backslash
+        # but are inside what looks like a JSON string value.
+        # A simpler approach is to use a more permissive parser, but we'll try cleaning first.
+        # This replaces literal newlines with escaped '\n'
+        s = re.sub(r'(?<=[:\s])"(.*?)"(?=[,\s}])', 
+                   lambda m: m.group(0).replace('\n', '\\n'), 
+                   s, flags=re.DOTALL)
+        return s
 
     try:
-        result = json.loads(raw)
+        cleaned = clean_json_string(raw)
+        result = json.loads(cleaned)
+        
+        # If the model nested the response, unpack it correctly
+        answer_text = result.get("answer", "")
+        final_references = result.get("references", [])
+        
         return {
-            "answer": result.get("answer", ""),
-            "references": result.get("references", []),
+            "answer": answer_text if isinstance(answer_text, str) else json.dumps(answer_text),
+            "references": final_references if isinstance(final_references, list) else []
         }
-    except json.JSONDecodeError:
+    except Exception as e:
+        print(f"JSON parsing error: {e}")
+        # Final fallback: if it looks like a JSON but parsing failed, 
+        # try to extract the answer field via regex
+        ans_match = re.search(r'"answer":\s*"(.*?)"(?=,\s*"references"|})', cleaned, re.DOTALL)
+        if ans_match:
+            return {"answer": ans_match.group(1).replace('\\n', '\n'), "references": []}
+            
         return {"answer": raw, "references": []}

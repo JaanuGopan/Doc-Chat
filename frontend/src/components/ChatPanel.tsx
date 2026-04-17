@@ -288,9 +288,18 @@ export const ChatPanel = ({
                           : "bg-background border border-border text-foreground rounded-tl-none"
                       }`}
                     >
-                      <div className={`prose prose-sm max-w-none break-words overflow-x-auto text-[13px] leading-relaxed [&_p]:my-1 [&_ul]:my-1 [&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-sm ${message.type === "user" ? "prose-invert" : "dark:prose-invert"}`}>
+                      <div className={`prose prose-sm max-w-none break-words overflow-x-auto text-[15px] leading-relaxed [&_p]:my-1 [&_ul]:my-1 [&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-sm ${message.type === "user" ? "prose-invert" : "dark:prose-invert"}`}>
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {message.content}
+                          {(() => {
+                            try {
+                              // Check if content is a JSON string (failsafe for backend parsing issues)
+                              if (message.content.trim().startsWith('{')) {
+                                const parsed = JSON.parse(message.content);
+                                if (parsed.answer) return parsed.answer;
+                              }
+                            } catch (e) {}
+                            return message.content;
+                          })()}
                         </ReactMarkdown>
                       </div>
                     </div>
@@ -354,7 +363,7 @@ export const ChatPanel = ({
                 <div className="space-y-1">
                   <button
                     onClick={() => fileInputRef.current?.click()}
-                    className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] rounded-lg hover:bg-muted transition-colors text-left"
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-sm rounded-lg hover:bg-muted transition-colors text-left"
                   >
                     <Upload className="h-4 w-4 text-primary" />
                     <span>Upload Document</span>
@@ -362,7 +371,7 @@ export const ChatPanel = ({
                   <div className="flex items-center justify-between px-3 py-2 rounded-lg hover:bg-muted transition-colors">
                     <div className="flex items-center gap-2.5">
                       <BrainCircuit className="h-4 w-4 text-amber-500" />
-                      <span className="text-[13px]">Thinking Mode</span>
+                      <span className="text-sm">Thinking Mode</span>
                     </div>
                     <Switch
                       checked={thinkingEnabled}
@@ -378,7 +387,7 @@ export const ChatPanel = ({
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               placeholder={placeholder ?? "Type a message…"}
-              className="flex-1 border-none bg-transparent focus-visible:ring-0 text-[13px] h-9 p-0 shadow-none"
+              className="flex-1 border-none bg-transparent focus-visible:ring-0 text-sm h-9 p-0 shadow-none"
             />
             
             <Button
